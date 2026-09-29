@@ -1,0 +1,6 @@
+build/
+build_cmsis/
+tap_rhythm/build/
+*.o
+__pycache__/
+*.pyc

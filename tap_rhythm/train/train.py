@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Train the tap-rhythm classifier and export it for TensorFlow Lite Micro.
+
+Pipeline:  synthetic data -> Keras MLP -> int8 TFLite model -> C source file
+
+Run from anywhere (inside the Zephyr venv):
+    python edge-ai/tap_rhythm/train/train.py
+
+Optional: pass CSV files logged by the firmware ("log" mode, SW3 held at boot)
+to mix real taps into the training set:
+    python train.py --real my_taps.csv
+CSV rows are:  label,i1,i2,i3,i4,i5   (label = class index, intervals in ms)
+"""
+
+import argparse
+import os
+
+import numpy as np
+import tensorflow as tf
+
+CLASSES = ["steady", "gallop", "speed_up", "slow_down", "irregular"]
+N_TAPS = 6
+N_INTERVALS = N_TAPS - 1
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.join(HERE, "..", "src")
+
+
+def features(intervals):
+    """Tempo-invariant features: each gap divided by the mean gap.
+
+    Tapping the same rhythm faster or slower gives the same features, so the
+    network only has to learn the *shape* of the rhythm. The firmware computes
+    exactly the same thing in main.cpp.
+    """
+    intervals = np.asarray(intervals, dtype=np.float32)
+    return intervals / intervals.mean(axis=-1, keepdims=True)
+
+
+def ideal_rhythm(cls, rng):
+    """Noise-free intervals (relative units) for one example of a class."""
+    k = np.arange(N_INTERVALS)
+    if cls == 0:  # steady: all gaps equal
+        return np.ones(N_INTERVALS)
+    if cls == 1:  # gallop: alternating short / long, either phase
+        ratio = rng.uniform(1.8, 3.0)
+        pattern = np.where(k % 2 == 0, 1.0, ratio)
+        return pattern if rng.random() < 0.5 else pattern[::-1]
+    if cls == 2:  # speed up: each gap shorter than the previous one
+        return rng.uniform(0.65, 0.85) ** k
+    if cls == 3:  # slow down: each gap longer than the previous one
+        return rng.uniform(1.2, 1.55) ** k
+    if cls == 4:  # irregular: independent random gaps ("none of the above")
+        return np.exp(rng.uniform(np.log(0.3), np.log(3.0), N_INTERVALS))
+    raise ValueError(cls)
+
+
+def make_dataset(n_per_class, rng, jitter=0.12):
+    xs, ys = [], []
+    for cls in range(len(CLASSES)):
+        for _ in range(n_per_class):
+            tempo_ms = rng.uniform(150, 600)  # human tapping range
+            gaps = ideal_rhythm(cls, rng) * tempo_ms
+            gaps *= rng.normal(1.0, jitter, N_INTERVALS)  # human timing error
+            xs.append(features(np.clip(gaps, 30, None)))
+            ys.append(cls)
+    xs, ys = np.array(xs, np.float32), np.array(ys, np.int32)
+    order = rng.permutation(len(ys))
+    return xs[order], ys[order]
+
+
+def load_real(paths):
+    xs, ys = [], []
+    for p in paths:
+        for row in np.loadtxt(p, delimiter=",", ndmin=2):
+            ys.append(int(row[0]))
+            xs.append(features(row[1:1 + N_INTERVALS]))
+    return np.array(xs, np.float32), np.array(ys, np.int32)
+
+
+def build_model():
+    return tf.keras.Sequential([
+        tf.keras.Input(shape=(N_INTERVALS,)),
+        tf.keras.layers.Dense(16, activation="relu"),
+        tf.keras.layers.Dense(16, activation="relu"),
+        tf.keras.layers.Dense(len(CLASSES), activation="softmax"),
+    ])
+
+
+def to_int8_tflite(model, rep_data):
+    """Full-integer quantization: weights AND activations become int8."""
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    def representative_dataset():
+        # The converter runs these samples through the model to learn the
+        # value range of every tensor, which sets its scale/zero_point.
+        for x in rep_data[:500]:
+            yield [x[None, :]]
+
+    converter.representative_dataset = representative_dataset
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+    return converter.convert()
+
+
+def eval_tflite(tflite_model, xs, ys):
+    interp = tf.lite.Interpreter(model_content=tflite_model)
+    interp.allocate_tensors()
+    inp, out = interp.get_input_details()[0], interp.get_output_details()[0]
+    in_scale, in_zp = inp["quantization"]
+    correct = 0
+    for x, y in zip(xs, ys):
+        q = np.clip(np.round(x / in_scale + in_zp), -128, 127).astype(np.int8)
+        interp.set_tensor(inp["index"], q[None, :])
+        interp.invoke()
+        correct += int(np.argmax(interp.get_tensor(out["index"])[0]) == y)
+    return correct / len(ys)
+
+
+def write_c_source(tflite_model, test_x, test_y):
+    body = ",\n".join(
+        "\t" + ", ".join(f"0x{b:02x}" for b in tflite_model[i:i + 12])
+        for i in range(0, len(tflite_model), 12))
+    vectors = ",\n".join(
+        "\t{" + ", ".join(f"{v:.4f}f" for v in x) + "}" for x in test_x)
+    names = ", ".join(f'"{c}"' for c in CLASSES)
+
+    with open(os.path.join(SRC_DIR, "model_data.h"), "w") as f:
+        f.write(f"""/* Generated by train/train.py - do not edit. */
+#ifndef TAP_RHYTHM_MODEL_DATA_H_
+#define TAP_RHYTHM_MODEL_DATA_H_
+
+#define NUM_CLASSES   {len(CLASSES)}
+#define NUM_INTERVALS {N_INTERVALS}
+#define NUM_TESTS     {len(test_y)}
+
+extern const unsigned char g_tap_model[];
+extern const unsigned int g_tap_model_len;
+extern const char *const g_class_names[NUM_CLASSES];
+
+/* Noise-free feature vectors used by the boot self-test. */
+extern const float g_test_features[NUM_TESTS][NUM_INTERVALS];
+extern const int g_test_labels[NUM_TESTS];
+
+#endif /* TAP_RHYTHM_MODEL_DATA_H_ */
+""")
+
+    with open(os.path.join(SRC_DIR, "model_data.cc"), "w") as f:
+        f.write(f"""/* Generated by train/train.py - do not edit. */
+#include "model_data.h"
+
+/* TFLM requires the flatbuffer to be 16-byte aligned. */
+alignas(16) const unsigned char g_tap_model[] = {{
+{body}
+}};
+const unsigned int g_tap_model_len = {len(tflite_model)};
+
+const char *const g_class_names[NUM_CLASSES] = {{{names}}};
+
+const float g_test_features[NUM_TESTS][NUM_INTERVALS] = {{
+{vectors}
+}};
+const int g_test_labels[NUM_TESTS] = {{{", ".join(str(int(y)) for y in test_y)}}};
+""")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--real", nargs="*", default=[], help="CSV files of real taps")
+    ap.add_argument("--epochs", type=int, default=40)
+    args = ap.parse_args()
+
+    rng = np.random.default_rng(42)
+    tf.keras.utils.set_random_seed(42)
+
+    x_train, y_train = make_dataset(2000, rng)
+    x_test, y_test = make_dataset(300, rng)
+    if args.real:
+        rx, ry = load_real(args.real)
+        print(f"Adding {len(ry)} real samples")
+        x_train, y_train = np.concatenate([x_train, rx]), np.concatenate([y_train, ry])
+
+    model = build_model()
+    model.compile(optimizer="adam", loss="sparse_categorical_crossentropy",
+                  metrics=["accuracy"])
+    model.summary()
+    model.fit(x_train, y_train, epochs=args.epochs, batch_size=64,
+              validation_split=0.1, verbose=2)
+    _, float_acc = model.evaluate(x_test, y_test, verbose=0)
+
+    tflite_model = to_int8_tflite(model, x_train)
+    int8_acc = eval_tflite(tflite_model, x_test, y_test)
+    with open(os.path.join(HERE, "tap_rhythm.tflite"), "wb") as f:
+        f.write(tflite_model)
+
+    # One clean example per class for the on-device self-test.
+    test_x = np.array([features(ideal_rhythm(c, np.random.default_rng(c)))
+                       for c in range(len(CLASSES))], np.float32)
+    test_y = np.arange(len(CLASSES))
+    write_c_source(tflite_model, test_x, test_y)
+
+    print(f"\nFloat32 test accuracy: {float_acc * 100:.1f}%")
+    print(f"Int8    test accuracy: {int8_acc * 100:.1f}%")
+    print(f"Model size: {len(tflite_model)} bytes -> src/model_data.cc")
+
+
+if __name__ == "__main__":
+    main()
